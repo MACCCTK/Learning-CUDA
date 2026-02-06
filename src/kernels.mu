@@ -1,7 +1,266 @@
 #include <vector>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <type_traits>
 #include <musa_fp16.h>
 
 #include "../tester/utils.h"
+
+namespace {
+
+template <typename T>
+__device__ inline float to_float_device(T v) {
+  return static_cast<float>(v);
+}
+
+template <>
+__device__ inline float to_float_device<half>(half v) {
+  return __half2float(v);
+}
+
+template <typename T>
+__device__ inline T from_float_device(float v) {
+  return static_cast<T>(v);
+}
+
+template <>
+__device__ inline half from_float_device<half>(float v) {
+  return __float2half(v);
+}
+
+template <typename T>
+__global__ void trace_reduce_kernel(const T* __restrict__ d_input,
+                                    T* __restrict__ d_output,
+                                    size_t n,
+                                    size_t stride) {
+  extern __shared__ unsigned char smem[];
+  T* sdata = reinterpret_cast<T*>(smem);
+  unsigned int tid = threadIdx.x;
+  size_t idx = blockIdx.x * blockDim.x + tid;
+  size_t grid_stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+
+  T local = T(0);
+  for (size_t i = idx; i < n; i += grid_stride) {
+    local += d_input[i * stride];
+  }
+
+  sdata[tid] = local;
+  __syncthreads();
+
+  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      sdata[tid] += sdata[tid + s];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    d_output[blockIdx.x] = sdata[0];
+  }
+}
+
+template <typename T>
+__global__ void trace_atomic_kernel(const T* __restrict__ d_input,
+                                    T* __restrict__ d_out,
+                                    size_t n,
+                                    size_t stride) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    atomicAdd(d_out, d_input[idx * stride]);
+  }
+}
+
+template <typename T>
+__global__ void flash_attention_kernel(const T* __restrict__ q,
+                                       const T* __restrict__ k,
+                                       const T* __restrict__ v,
+                                       T* __restrict__ o,
+                                       int batch_size,
+                                       int target_seq_len,
+                                       int src_seq_len,
+                                       int query_heads,
+                                       int kv_heads,
+                                       int head_dim,
+                                       int is_causal,
+                                       float scale) {
+  int tq = blockIdx.x;
+  int bh = blockIdx.y;
+  if (tq >= target_seq_len || bh >= batch_size * query_heads) {
+    return;
+  }
+
+  int b = bh / query_heads;
+  int hq = bh - b * query_heads;
+  int kv_group = query_heads / kv_heads;
+  int hk = hq / kv_group;
+
+  int tid = threadIdx.x;
+
+  extern __shared__ unsigned char smem[];
+  float* sh_red = reinterpret_cast<float*>(smem);
+  float* sh_q = sh_red + blockDim.x;
+  float* sh_acc = sh_q + head_dim;
+
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    size_t q_idx =
+        ((static_cast<size_t>(b) * target_seq_len + tq) * query_heads + hq) *
+            head_dim +
+        d;
+    sh_q[d] = to_float_device<T>(q[q_idx]);
+    sh_acc[d] = 0.0f;
+  }
+  if (blockDim.x == 32) {
+    __syncwarp();
+  } else {
+    __syncthreads();
+  }
+
+  float m = -INFINITY;
+  float l = 0.0f;
+  int ts_end = src_seq_len;
+  if (is_causal) {
+    int limit = tq + 1;
+    ts_end = (limit < src_seq_len) ? limit : src_seq_len;
+  }
+
+  for (int ts = 0; ts < ts_end; ++ts) {
+    size_t k_base =
+        ((static_cast<size_t>(b) * src_seq_len + ts) * kv_heads + hk) * head_dim;
+    float exp_scale = 1.0f;
+    float exp_score = 0.0f;
+    if (tid == 0) {
+      float dot = 0.0f;
+      if constexpr (std::is_same<T, float>::value) {
+        const uintptr_t q_addr = reinterpret_cast<uintptr_t>(sh_q);
+        const uintptr_t k_addr = reinterpret_cast<uintptr_t>(k + k_base);
+        if ((head_dim % 2 == 0) &&
+            (q_addr % alignof(float2) == 0) &&
+            (k_addr % alignof(float2) == 0)) {
+          const float2* q2 = reinterpret_cast<const float2*>(sh_q);
+          const float2* k2 = reinterpret_cast<const float2*>(k + k_base);
+          int n2 = head_dim / 2;
+          for (int i = 0; i < n2; ++i) {
+            float2 qv = q2[i];
+            float2 kv = k2[i];
+            dot = fmaf(qv.x, kv.x, dot);
+            dot = fmaf(qv.y, kv.y, dot);
+          }
+        } else {
+          for (int d = 0; d < head_dim; ++d) {
+            float kv = to_float_device<T>(k[k_base + d]);
+            dot += sh_q[d] * kv;
+          }
+        }
+      } else if constexpr (std::is_same<T, half>::value) {
+        const uintptr_t k_addr = reinterpret_cast<uintptr_t>(k + k_base);
+        if ((head_dim % 2 == 0) && (k_addr % alignof(half2) == 0)) {
+          const half2* k2 = reinterpret_cast<const half2*>(k + k_base);
+          int n2 = head_dim / 2;
+          for (int i = 0; i < n2; ++i) {
+            half2 kvh2 = k2[i];
+            float2 kv = __half22float2(kvh2);
+            float q0 = sh_q[2 * i];
+            float q1 = sh_q[2 * i + 1];
+            dot = fmaf(q0, kv.x, dot);
+            dot = fmaf(q1, kv.y, dot);
+          }
+        } else {
+          for (int d = 0; d < head_dim; ++d) {
+            float kv = to_float_device<T>(k[k_base + d]);
+            dot += sh_q[d] * kv;
+          }
+        }
+      } else {
+        for (int d = 0; d < head_dim; ++d) {
+          float kv = to_float_device<T>(k[k_base + d]);
+          dot += sh_q[d] * kv;
+        }
+      }
+      float score = dot * scale;
+      if (score > m) {
+        exp_scale = (m == -INFINITY) ? 0.0f : expf(m - score);
+        exp_score = 1.0f;
+        m = score;
+      } else {
+        exp_score = expf(score - m);
+      }
+      l = l * exp_scale + exp_score;
+      sh_red[0] = exp_scale;
+      sh_red[1] = exp_score;
+      sh_red[2] = l;
+    }
+    if (blockDim.x == 32) {
+      __syncwarp();
+    } else {
+      __syncthreads();
+    }
+    exp_scale = sh_red[0];
+    exp_score = sh_red[1];
+    l = sh_red[2];
+
+    size_t v_base = k_base;
+    if constexpr (std::is_same<T, float>::value) {
+      const uintptr_t v_addr = reinterpret_cast<uintptr_t>(v + v_base);
+      if ((head_dim % 2 == 0) && (v_addr % alignof(float2) == 0)) {
+        const float2* v2 = reinterpret_cast<const float2*>(v + v_base);
+        int n2 = head_dim / 2;
+        for (int i = tid; i < n2; i += blockDim.x) {
+          float2 vv = v2[i];
+          int d0 = 2 * i;
+          int d1 = d0 + 1;
+          sh_acc[d0] = fmaf(exp_score, vv.x, sh_acc[d0] * exp_scale);
+          sh_acc[d1] = fmaf(exp_score, vv.y, sh_acc[d1] * exp_scale);
+        }
+      } else {
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+          float vv = to_float_device<T>(v[v_base + d]);
+          sh_acc[d] = fmaf(exp_score, vv, sh_acc[d] * exp_scale);
+        }
+      }
+    } else if constexpr (std::is_same<T, half>::value) {
+      const uintptr_t v_addr = reinterpret_cast<uintptr_t>(v + v_base);
+      if ((head_dim % 2 == 0) && (v_addr % alignof(half2) == 0)) {
+        const half2* v2 = reinterpret_cast<const half2*>(v + v_base);
+        int n2 = head_dim / 2;
+        for (int i = tid; i < n2; i += blockDim.x) {
+          half2 vvh2 = v2[i];
+          float2 vv = __half22float2(vvh2);
+          int d0 = 2 * i;
+          int d1 = d0 + 1;
+          sh_acc[d0] = fmaf(exp_score, vv.x, sh_acc[d0] * exp_scale);
+          sh_acc[d1] = fmaf(exp_score, vv.y, sh_acc[d1] * exp_scale);
+        }
+      } else {
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+          float vv = to_float_device<T>(v[v_base + d]);
+          sh_acc[d] = fmaf(exp_score, vv, sh_acc[d] * exp_scale);
+        }
+      }
+    } else {
+      for (int d = tid; d < head_dim; d += blockDim.x) {
+        float vv = to_float_device<T>(v[v_base + d]);
+        sh_acc[d] = fmaf(exp_score, vv, sh_acc[d] * exp_scale);
+      }
+    }
+
+    if (blockDim.x == 32) {
+      __syncwarp();
+    } else {
+      __syncthreads();
+    }
+  }
+
+  float inv_l = (l > 0.0f && l == l) ? (1.0f / l) : 0.0f;
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    size_t o_idx =
+        ((static_cast<size_t>(b) * target_seq_len + tq) * query_heads + hq) *
+            head_dim +
+        d;
+    o[o_idx] = from_float_device<T>(sh_acc[d] * inv_l);
+  }
+}
+
+}  // namespace
 
 /**
  * @brief Computes the trace of a matrix.
@@ -19,13 +278,70 @@
  */
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  // TODO: Implement the trace function
-  return T(-1);
+  size_t min_dim = std::min(rows, cols);
+  if (h_input.empty() || min_dim == 0) {
+    return T(0);
+  }
+
+  constexpr size_t kAtomicThreshold = 4096;
+
+  const size_t stride = cols + 1;
+
+  T* d_input = nullptr;
+  T* d_out = nullptr;
+  RUNTIME_CHECK(musaMalloc(&d_input, h_input.size() * sizeof(T)));
+  RUNTIME_CHECK(musaMemcpy(d_input, h_input.data(),
+                           h_input.size() * sizeof(T),
+                           musaMemcpyHostToDevice));
+
+  int block_size = 256;
+  int max_blocks = 1024;
+  int grid_size = static_cast<int>((min_dim + block_size - 1) / block_size);
+  if (grid_size > max_blocks) {
+    grid_size = max_blocks;
+  }
+
+  if (min_dim <= kAtomicThreshold) {
+    RUNTIME_CHECK(musaMalloc(&d_out, sizeof(T)));
+    RUNTIME_CHECK(musaMemset(d_out, 0, sizeof(T)));
+    trace_atomic_kernel<<<grid_size, block_size>>>(d_input, d_out, min_dim, stride);
+    RUNTIME_CHECK(musaGetLastError());
+    RUNTIME_CHECK(musaDeviceSynchronize());
+
+    T result = T(0);
+    RUNTIME_CHECK(musaMemcpy(&result, d_out, sizeof(T), musaMemcpyDeviceToHost));
+    RUNTIME_CHECK(musaFree(d_out));
+    RUNTIME_CHECK(musaFree(d_input));
+    return result;
+  }
+
+  T* d_partials = nullptr;
+  RUNTIME_CHECK(musaMalloc(&d_partials, grid_size * sizeof(T)));
+
+  trace_reduce_kernel<<<grid_size, block_size, block_size * sizeof(T)>>>(
+      d_input, d_partials, min_dim, stride);
+  RUNTIME_CHECK(musaGetLastError());
+  RUNTIME_CHECK(musaDeviceSynchronize());
+
+  RUNTIME_CHECK(musaMalloc(&d_out, sizeof(T)));
+  trace_reduce_kernel<<<1, block_size, block_size * sizeof(T)>>>(
+      d_partials, d_out, static_cast<size_t>(grid_size), 1);
+  RUNTIME_CHECK(musaGetLastError());
+  RUNTIME_CHECK(musaDeviceSynchronize());
+
+  T result = T(0);
+  RUNTIME_CHECK(musaMemcpy(&result, d_out, sizeof(T), musaMemcpyDeviceToHost));
+
+  RUNTIME_CHECK(musaFree(d_out));
+  RUNTIME_CHECK(musaFree(d_partials));
+  RUNTIME_CHECK(musaFree(d_input));
+
+  return result;
 }
 
 /**
  * @brief Computes flash attention for given query, key, and value tensors.
- * 
+ *
  * @tparam T Data type (float) for input/output tensors
  * @param[in] h_q Query tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
  * @param[in] h_k Key tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
@@ -33,7 +349,7 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
  * @param[out] h_o Output attention tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
  * @param[in] batch_size Batch dimension size
  * @param[in] target_seq_len Target sequence length
- * @param[in] src_seq_len Source sequence length  
+ * @param[in] src_seq_len Source sequence length
  * @param[in] query_heads Number of query attention heads
  * @param[in] kv_heads Number of key/value heads (supports grouped query attention)
  * @param[in] head_dim Dimension size of each attention head
@@ -42,8 +358,70 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
+                    int batch_size, int target_seq_len, int src_seq_len,
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) {
+  if (batch_size <= 0 || target_seq_len <= 0 || src_seq_len <= 0 ||
+      query_heads <= 0 || kv_heads <= 0 || head_dim <= 0) {
+    h_o.clear();
+    return;
+  }
+  if (query_heads % kv_heads != 0) {
+    h_o.clear();
+    return;
+  }
+
+  const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+  size_t q_size = static_cast<size_t>(batch_size) * target_seq_len * query_heads * head_dim;
+  size_t k_size = static_cast<size_t>(batch_size) * src_seq_len * kv_heads * head_dim;
+  size_t v_size = k_size;
+  size_t o_size = q_size;
+  h_o.resize(o_size);
+
+  T* d_q = nullptr;
+  T* d_k = nullptr;
+  T* d_v = nullptr;
+  T* d_o = nullptr;
+  RUNTIME_CHECK(musaMalloc(&d_q, q_size * sizeof(T)));
+  RUNTIME_CHECK(musaMalloc(&d_k, k_size * sizeof(T)));
+  RUNTIME_CHECK(musaMalloc(&d_v, v_size * sizeof(T)));
+  RUNTIME_CHECK(musaMalloc(&d_o, o_size * sizeof(T)));
+
+  RUNTIME_CHECK(musaMemcpy(d_q, h_q.data(), q_size * sizeof(T), musaMemcpyHostToDevice));
+  RUNTIME_CHECK(musaMemcpy(d_k, h_k.data(), k_size * sizeof(T), musaMemcpyHostToDevice));
+  RUNTIME_CHECK(musaMemcpy(d_v, h_v.data(), v_size * sizeof(T), musaMemcpyHostToDevice));
+
+  int threads = 1;
+  if (head_dim <= 32) {
+    threads = 32;
+  } else {
+    while (threads < head_dim) {
+      threads <<= 1;
+    }
+    if (threads < 32) {
+      threads = 32;
+    }
+    if (threads > 256) {
+      threads = 256;
+    }
+  }
+
+  dim3 block(static_cast<unsigned int>(threads), 1, 1);
+  dim3 grid(static_cast<unsigned int>(target_seq_len),
+            static_cast<unsigned int>(batch_size * query_heads),
+            1);
+  size_t shmem = static_cast<size_t>(threads + head_dim + head_dim) * sizeof(float);
+  flash_attention_kernel<<<grid, block, shmem>>>(
+      d_q, d_k, d_v, d_o, batch_size, target_seq_len, src_seq_len, query_heads,
+      kv_heads, head_dim, is_causal ? 1 : 0, scale);
+  RUNTIME_CHECK(musaGetLastError());
+  RUNTIME_CHECK(musaDeviceSynchronize());
+
+  RUNTIME_CHECK(musaMemcpy(h_o.data(), d_o, o_size * sizeof(T), musaMemcpyDeviceToHost));
+
+  RUNTIME_CHECK(musaFree(d_o));
+  RUNTIME_CHECK(musaFree(d_v));
+  RUNTIME_CHECK(musaFree(d_k));
+  RUNTIME_CHECK(musaFree(d_q));
 }
 
 // *********************************************************************

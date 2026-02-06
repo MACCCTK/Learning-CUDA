@@ -1,7 +1,324 @@
 #include <vector>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <type_traits>
 #include <cuda_fp16.h>
+#include <cuda_runtime.h>
 
 #include "../tester/utils.h"
+
+namespace {
+
+// Device-side cast helper for generic types.
+template <typename T>
+__device__ inline float to_float_device(T v) {
+  return static_cast<float>(v);
+}
+
+// Device-side cast helper specialized for half.
+template <>
+__device__ inline float to_float_device<half>(half v) {
+  return __half2float(v);
+}
+
+// Device-side cast helper for generic types.
+template <typename T>
+__device__ inline T from_float_device(float v) {
+  return static_cast<T>(v);
+}
+
+// Device-side cast helper specialized for half.
+template <>
+__device__ inline half from_float_device<half>(float v) {
+  return __float2half(v);
+}
+
+// Block-level reduction for trace: sums strided diagonal values.
+template <typename T>
+__global__ void trace_reduce_kernel(const T* __restrict__ d_input,
+                                    T* __restrict__ d_output,
+                                    size_t n,
+                                    size_t stride) {
+  // Grid-stride loop over diagonal elements for load balancing.
+  extern __shared__ unsigned char shared_mem[];
+  T* shared_data = reinterpret_cast<T*>(shared_mem);
+  unsigned int tid = threadIdx.x;
+  size_t idx = blockIdx.x * blockDim.x + tid;
+  size_t grid_stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+
+  T local = T(0);
+  for (size_t i = idx; i < n; i += grid_stride) {
+    local += d_input[i * stride];
+  }
+
+  shared_data[tid] = local;
+  __syncthreads();
+
+#if defined(PLATFORM_NVIDIA)
+  // Use warp shuffle for the final 32 lanes on NVIDIA.
+  for (unsigned int s = blockDim.x / 2; s > 32; s >>= 1) {
+    if (tid < s) {
+      shared_data[tid] += shared_data[tid + s];
+    }
+    __syncthreads();
+  }
+
+  if (tid < 32) {
+    T v = shared_data[tid];
+    if (blockDim.x >= 64) {
+      v += shared_data[tid + 32];
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      v += __shfl_down_sync(0xffffffff, v, offset);
+    }
+    if (tid == 0) {
+      d_output[blockIdx.x] = v;
+    }
+  }
+#else
+  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      shared_data[tid] += shared_data[tid + s];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    d_output[blockIdx.x] = shared_data[0];
+  }
+#endif
+}
+
+// Atomic trace kernel for small matrices.
+template <typename T>
+__global__ void trace_atomic_kernel(const T* __restrict__ d_input,
+                                    T* __restrict__ d_out,
+                                    size_t n,
+                                    size_t stride) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    atomicAdd(d_out, d_input[idx * stride]);
+  }
+}
+
+// Cached device buffers for trace to reduce reallocations.
+template <typename T>
+struct TraceCache {
+  T* d_input = nullptr;
+  T* d_interim = nullptr;
+  T* d_output = nullptr;
+  size_t input_capacity = 0;
+  size_t interim_capacity = 0;
+  int device = -1;
+};
+
+// Returns a per-type static trace cache instance.
+template <typename T>
+TraceCache<T>& get_trace_cache() {
+  static TraceCache<T> cache;
+  return cache;
+}
+
+template <typename T>
+__global__ void flash_attention_kernel(const T* __restrict__ q,
+                                       const T* __restrict__ k,
+                                       const T* __restrict__ v,
+                                       T* __restrict__ o,
+                                       int batch_size,
+                                       int target_seq_len,
+                                       int src_seq_len,
+                                       int query_heads,
+                                       int kv_heads,
+                                       int head_dim,
+                                       int is_causal,
+                                       float scale) {
+  int tq = blockIdx.x;
+  int bh = blockIdx.y;
+  if (tq >= target_seq_len || bh >= batch_size * query_heads) {
+    return;
+  }
+
+  int b = bh / query_heads;
+  int hq = bh - b * query_heads;
+  int kv_group = query_heads / kv_heads;
+  int hk = hq / kv_group;
+
+  int tid = threadIdx.x;
+
+  // 1) Shared-memory reuse for Q and accumulator.
+  extern __shared__ float smem[];
+  float* sh_red = smem;
+  float* sh_q = sh_red + blockDim.x;
+  float* sh_acc = sh_q + head_dim;
+
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    size_t q_idx =
+        ((static_cast<size_t>(b) * target_seq_len + tq) * query_heads + hq) *
+            head_dim +
+        d;
+    sh_q[d] = to_float_device<T>(q[q_idx]);
+    sh_acc[d] = 0.0f;
+  }
+
+  // 2) Warp sync fast path when blockDim.x == 32.
+  if (blockDim.x == 32) {
+    __syncwarp();
+  } else {
+    __syncthreads();
+  }
+
+  float m = -INFINITY;
+  float l = 0.0f;
+  int ts_end = src_seq_len;
+  if (is_causal) {
+    // 3) Causal mask: only attend to positions <= tq.
+    int limit = tq + 1;
+    ts_end = (limit < src_seq_len) ? limit : src_seq_len;
+  }
+
+  for (int ts = 0; ts < ts_end; ++ts) {
+    size_t k_base =
+        ((static_cast<size_t>(b) * src_seq_len + ts) * kv_heads + hk) * head_dim;
+    float exp_scale = 1.0f;
+    float exp_score = 0.0f;
+    if (tid == 0) {
+      // 4) Serial QK dot in thread 0 to keep a fixed reduction order.
+      float dot = 0.0f;
+      if constexpr (std::is_same<T, float>::value) {
+        const uintptr_t q_addr = reinterpret_cast<uintptr_t>(sh_q);
+        const uintptr_t k_addr = reinterpret_cast<uintptr_t>(k + k_base);
+        if ((head_dim % 2 == 0) &&
+            (q_addr % alignof(float2) == 0) &&
+            (k_addr % alignof(float2) == 0)) {
+          // 5) Vectorized float2 loads when aligned.
+          const float2* q2 = reinterpret_cast<const float2*>(sh_q);
+          const float2* k2 = reinterpret_cast<const float2*>(k + k_base);
+          int n2 = head_dim / 2;
+          for (int i = 0; i < n2; ++i) {
+            float2 qv = q2[i];
+            float2 kv = k2[i];
+            dot = fmaf(qv.x, kv.x, dot);
+            dot = fmaf(qv.y, kv.y, dot);
+          }
+        } else {
+          for (int d = 0; d < head_dim; ++d) {
+            float kv = to_float_device<T>(k[k_base + d]);
+            dot = fmaf(sh_q[d], kv, dot);
+          }
+        }
+      } else if constexpr (std::is_same<T, half>::value) {
+        const uintptr_t k_addr = reinterpret_cast<uintptr_t>(k + k_base);
+        if ((head_dim % 2 == 0) && (k_addr % alignof(half2) == 0)) {
+          const half2* k2 = reinterpret_cast<const half2*>(k + k_base);
+          int n2 = head_dim / 2;
+          for (int i = 0; i < n2; ++i) {
+            half2 kvh2 = k2[i];
+            float2 kv = __half22float2(kvh2);
+            float q0 = sh_q[2 * i];
+            float q1 = sh_q[2 * i + 1];
+            dot = fmaf(q0, kv.x, dot);
+            dot = fmaf(q1, kv.y, dot);
+          }
+        } else {
+          for (int d = 0; d < head_dim; ++d) {
+            float kv = to_float_device<T>(k[k_base + d]);
+            dot = fmaf(sh_q[d], kv, dot);
+          }
+        }
+      } else {
+        for (int d = 0; d < head_dim; ++d) {
+          float kv = to_float_device<T>(k[k_base + d]);
+          dot = fmaf(sh_q[d], kv, dot);
+        }
+      }
+      float score = dot * scale;
+      // 6) Online softmax (m,l) update.
+      if (score > m) {
+        exp_scale = (m == -INFINITY) ? 0.0f : expf(m - score);
+        exp_score = 1.0f;
+        m = score;
+      } else {
+        exp_score = expf(score - m);
+      }
+      l = l * exp_scale + exp_score;
+      sh_red[0] = exp_scale;
+      sh_red[1] = exp_score;
+      sh_red[2] = l;
+    }
+    if (blockDim.x == 32) {
+      __syncwarp();
+    } else {
+      __syncthreads();
+    }
+    exp_scale = sh_red[0];
+    exp_score = sh_red[1];
+    l = sh_red[2];
+
+    size_t v_base = k_base;
+    if constexpr (std::is_same<T, float>::value) {
+      const uintptr_t v_addr = reinterpret_cast<uintptr_t>(v + v_base);
+      if ((head_dim % 2 == 0) &&
+          (v_addr % alignof(float2) == 0)) {
+        const float2* v2 = reinterpret_cast<const float2*>(v + v_base);
+        int n2 = head_dim / 2;
+        for (int i = tid; i < n2; i += blockDim.x) {
+          float2 vv = v2[i];
+          int d0 = 2 * i;
+          int d1 = d0 + 1;
+          sh_acc[d0] = fmaf(exp_score, vv.x, sh_acc[d0] * exp_scale);
+          sh_acc[d1] = fmaf(exp_score, vv.y, sh_acc[d1] * exp_scale);
+        }
+      } else {
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+          float vv = to_float_device<T>(v[v_base + d]);
+          sh_acc[d] = fmaf(exp_score, vv, sh_acc[d] * exp_scale);
+        }
+      }
+    } else if constexpr (std::is_same<T, half>::value) {
+      const uintptr_t v_addr = reinterpret_cast<uintptr_t>(v + v_base);
+      if ((head_dim % 2 == 0) &&
+          (v_addr % alignof(half2) == 0)) {
+        const half2* v2 = reinterpret_cast<const half2*>(v + v_base);
+        int n2 = head_dim / 2;
+        for (int i = tid; i < n2; i += blockDim.x) {
+          half2 vvh2 = v2[i];
+          float2 vv = __half22float2(vvh2);
+          int d0 = 2 * i;
+          int d1 = d0 + 1;
+          sh_acc[d0] = fmaf(exp_score, vv.x, sh_acc[d0] * exp_scale);
+          sh_acc[d1] = fmaf(exp_score, vv.y, sh_acc[d1] * exp_scale);
+        }
+      } else {
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+          float vv = to_float_device<T>(v[v_base + d]);
+          sh_acc[d] = fmaf(exp_score, vv, sh_acc[d] * exp_scale);
+        }
+      }
+    } else {
+      for (int d = tid; d < head_dim; d += blockDim.x) {
+        float vv = to_float_device<T>(v[v_base + d]);
+        sh_acc[d] = fmaf(exp_score, vv, sh_acc[d] * exp_scale);
+      }
+    }
+    if (blockDim.x == 32) {
+      __syncwarp();
+    } else {
+      __syncthreads();
+    }
+  }
+
+  float inv_l = (l > 0.0f && l == l) ? (1.0f / l) : 0.0f;
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    size_t o_idx =
+        ((static_cast<size_t>(b) * target_seq_len + tq) * query_heads + hq) *
+            head_dim +
+        d;
+    o[o_idx] = from_float_device<T>(sh_acc[d] * inv_l);
+  }
+}
+
+}  // namespace
 
 /**
  * @brief Computes the trace of a matrix.
@@ -19,8 +336,100 @@
  */
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  // TODO: Implement the trace function
-  return T(-1);
+  size_t dim = std::min(rows, cols);
+  if (h_input.empty() || dim == 0) {
+    return T(0);
+  }
+
+  constexpr size_t atomicThreshold = 4096;
+
+  const size_t stride = cols + 1;
+
+  // Reuse per-device buffers to avoid repeated allocations.
+  TraceCache<T>& cache = get_trace_cache<T>();
+  int device_id = 0;
+  RUNTIME_CHECK(cudaGetDevice(&device_id));
+  if (cache.device != device_id) {
+    if (cache.d_input) {
+      RUNTIME_CHECK(cudaFree(cache.d_input));
+    }
+    if (cache.d_interim) {
+      RUNTIME_CHECK(cudaFree(cache.d_interim));
+    }
+    if (cache.d_output) {
+      RUNTIME_CHECK(cudaFree(cache.d_output));
+    }
+    cache.d_input = nullptr;
+    cache.d_interim = nullptr;
+    cache.d_output = nullptr;
+    cache.input_capacity = 0;
+    cache.interim_capacity = 0;
+    cache.device = device_id;
+  }
+
+  const size_t input_elems = h_input.size();
+  // Grow cached buffers if needed.
+  if (input_elems > cache.input_capacity) {
+    if (cache.d_input) {
+      RUNTIME_CHECK(cudaFree(cache.d_input));
+    }
+    RUNTIME_CHECK(cudaMalloc(&cache.d_input, input_elems * sizeof(T)));
+    cache.input_capacity = input_elems;
+  }
+
+  if (!cache.d_output) {
+    RUNTIME_CHECK(cudaMalloc(&cache.d_output, sizeof(T)));
+  }
+
+  T* d_input = cache.d_input;
+  T* d_output = cache.d_output;
+
+  RUNTIME_CHECK(cudaMemcpy(d_input, h_input.data(),
+                           h_input.size() * sizeof(T),
+                           cudaMemcpyHostToDevice));
+
+  int block_size = 256;
+  int max_blocks = 1024;
+  int grid_size = static_cast<int>((dim + block_size - 1) / block_size);
+  if (grid_size > max_blocks) {
+    grid_size = max_blocks;
+  }
+
+  // For small matrices, use an atomic kernel to avoid a second reduction.
+  if (dim <= atomicThreshold) {
+    RUNTIME_CHECK(cudaMemset(d_output, 0, sizeof(T)));
+    trace_atomic_kernel<<<grid_size, block_size>>>(d_input, d_output, dim, stride);
+    RUNTIME_CHECK(cudaGetLastError());
+    RUNTIME_CHECK(cudaDeviceSynchronize());
+
+    T result = T(0);
+    RUNTIME_CHECK(cudaMemcpy(&result, d_output, sizeof(T), cudaMemcpyDeviceToHost));
+    return result;
+  }
+
+  if (static_cast<size_t>(grid_size) > cache.interim_capacity) {
+    if (cache.d_interim) {
+      RUNTIME_CHECK(cudaFree(cache.d_interim));
+    }
+    RUNTIME_CHECK(cudaMalloc(&cache.d_interim, grid_size * sizeof(T)));
+    cache.interim_capacity = static_cast<size_t>(grid_size);
+  }
+  T* d_interim = cache.d_interim;
+
+  trace_reduce_kernel<<<grid_size, block_size, block_size * sizeof(T)>>>(
+      d_input, d_interim, dim, stride);
+  RUNTIME_CHECK(cudaGetLastError());
+  RUNTIME_CHECK(cudaDeviceSynchronize());
+
+  trace_reduce_kernel<<<1, block_size, block_size * sizeof(T)>>>(
+      d_interim, d_output, static_cast<size_t>(grid_size), 1);
+  RUNTIME_CHECK(cudaGetLastError());
+  RUNTIME_CHECK(cudaDeviceSynchronize());
+
+  T result = T(0);
+  RUNTIME_CHECK(cudaMemcpy(&result, d_output, sizeof(T), cudaMemcpyDeviceToHost));
+
+  return result;
 }
 
 /**
@@ -42,9 +451,71 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // TODO: Implement the flash attention function
+                    int batch_size, int target_seq_len, int src_seq_len,
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) {
+  if (batch_size <= 0 || target_seq_len <= 0 || src_seq_len <= 0 ||
+      query_heads <= 0 || kv_heads <= 0 || head_dim <= 0) {
+    h_o.clear();
+    return;
+  }
+  if (query_heads % kv_heads != 0) {
+    h_o.clear();
+    return;
+  }
+
+  const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+  size_t q_size = static_cast<size_t>(batch_size) * target_seq_len * query_heads * head_dim;
+  size_t k_size = static_cast<size_t>(batch_size) * src_seq_len * kv_heads * head_dim;
+  size_t v_size = k_size;
+  size_t o_size = q_size;
+  h_o.resize(o_size);
+
+  T* d_q = nullptr;
+  T* d_k = nullptr;
+  T* d_v = nullptr;
+  T* d_o = nullptr;
+  RUNTIME_CHECK(cudaMalloc(&d_q, q_size * sizeof(T)));
+  RUNTIME_CHECK(cudaMalloc(&d_k, k_size * sizeof(T)));
+  RUNTIME_CHECK(cudaMalloc(&d_v, v_size * sizeof(T)));
+  RUNTIME_CHECK(cudaMalloc(&d_o, o_size * sizeof(T)));
+
+  RUNTIME_CHECK(cudaMemcpy(d_q, h_q.data(), q_size * sizeof(T), cudaMemcpyHostToDevice));
+  RUNTIME_CHECK(cudaMemcpy(d_k, h_k.data(), k_size * sizeof(T), cudaMemcpyHostToDevice));
+  RUNTIME_CHECK(cudaMemcpy(d_v, h_v.data(), v_size * sizeof(T), cudaMemcpyHostToDevice));
+
+  int threads = 1;
+  if (head_dim <= 32) {
+    threads = 32;
+  } else {
+    while (threads < head_dim) {
+      threads <<= 1;
+    }
+    if (threads < 32) {
+      threads = 32;
+    }
+    if (threads > 256) {
+      threads = 256;
+    }
+  }
+
+  dim3 block(static_cast<unsigned int>(threads), 1, 1);
+  dim3 grid(static_cast<unsigned int>(target_seq_len),
+            static_cast<unsigned int>(batch_size * query_heads),
+            1);
+  size_t shmem = static_cast<size_t>(threads + head_dim + head_dim) * sizeof(float);
+
+  flash_attention_kernel<<<grid, block, shmem>>>(
+      d_q, d_k, d_v, d_o, batch_size, target_seq_len, src_seq_len, query_heads,
+      kv_heads, head_dim, is_causal ? 1 : 0, scale);
+  RUNTIME_CHECK(cudaGetLastError());
+  RUNTIME_CHECK(cudaDeviceSynchronize());
+
+  RUNTIME_CHECK(cudaMemcpy(h_o.data(), d_o, o_size * sizeof(T), cudaMemcpyDeviceToHost));
+
+  RUNTIME_CHECK(cudaFree(d_o));
+  RUNTIME_CHECK(cudaFree(d_v));
+  RUNTIME_CHECK(cudaFree(d_k));
+  RUNTIME_CHECK(cudaFree(d_q));
 }
 
 // *********************************************************************
